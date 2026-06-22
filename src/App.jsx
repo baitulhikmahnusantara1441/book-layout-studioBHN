@@ -152,19 +152,54 @@ export default function App() {
     const r=new FileReader(); r.onload=e=>setContent(e.target.result); r.readAsText(file,"UTF-8");
   },[]);
 
+  // ── FOOTNOTE COUNTER (global across doc) ──
+  const fnCounterRef = { n: 0 };
+
   const parseCnt = text => {
     const lines=text.split("\n").map(l=>l.trim()).filter(Boolean);
     const secs=[];let cur=null,ps=[];
+    // Footnote patterns:
+    // Inline: teks[1] atau teks(1) atau teks^1  → simpan sebagai marker di dalam teks
+    // Block:  [1] Teks referensi  atau  (1) Teks  atau  ^1 Teks  → footnote definition
+    // [CATATAN] Teks → manual footnote tag
+    const fnDefs = {}; // { "1": "teks referensi", "2": ... }
+
+    // Pass 1: kumpulkan footnote definitions dari baris
     for(const line of lines){
+      // Pattern: [1] teks, (1) teks, ^1 teks di awal baris
+      const defMatch = line.match(/^[\[\(](\d+)[\]\)]\s+(.+)$/) || line.match(/^\^(\d+)\s+(.+)$/);
+      if(defMatch) { fnDefs[defMatch[1]] = defMatch[2]; }
+    }
+
+    // Pass 2: parse struktur
+    for(const line of lines){
+      // Skip baris yang merupakan footnote definition murni
+      const defMatch = line.match(/^[\[\(](\d+)[\]\)]\s+(.+)$/) || line.match(/^\^(\d+)\s+(.+)$/);
+      if(defMatch && fnDefs[defMatch[1]]) continue;
+
       if(/^#+\s/.test(line)||/^(BAB|PASAL|BAGIAN)\s+[IVX\d]/i.test(line)){
         if(cur) secs.push({...cur,p:ps}); cur={type:"h",text:line.replace(/^#+\s*/,"")}; ps=[];
       } else if(/^\[KUTIPAN\]/i.test(line)) ps.push({type:"q",text:line.replace(/^\[KUTIPAN\]/i,"").trim()});
       else if(/^\[ARAB\]/i.test(line))      ps.push({type:"a",text:line.replace(/^\[ARAB\]/i,"").trim()});
-      else if(/^\[CATATAN\]/i.test(line))   ps.push({type:"f",text:line.replace(/^\[CATATAN\]/i,"").trim()});
-      else ps.push({type:"p",text:line});
+      else if(/^\[CATATAN\]/i.test(line))   ps.push({type:"f",text:line.replace(/^\[CATATAN\]/i,"").trim(), fnKey:null});
+      else {
+        // Inline footnote markers: [1] (2) ^1 di dalam teks
+        const hasInline = /\[(\d+)\]|\((\d+)\)|\^(\d+)/.test(line);
+        ps.push({type:"p", text:line, fnDefs: hasInline ? fnDefs : null});
+      }
     }
     if(cur) secs.push({...cur,p:ps}); else if(ps.length) secs.push({type:"body",text:"",p:ps});
-    return secs;
+    return {secs, fnDefs};
+  };
+
+  // Render inline teks dengan superscript footnote marker
+  const renderInlineFn = (text, fnDefs, fnMap) => {
+    // fnMap: { "1": globalNum, "2": globalNum2 }
+    return text.replace(/\[(\d+)\]|\((\d+)\)|\^(\d+)/g, (match, a, b, c) => {
+      const key = a||b||c;
+      const num = fnMap[key] || key;
+      return `<sup style="font-size:0.7em;color:${TH.p};font-weight:700;line-height:0;vertical-align:super">${num}</sup>`;
+    });
   };
 
   const iHTML = t => t.replace(/\b([a-zA-Z]+(?:\s+[a-zA-Z]+){0,3})\b/g, m=>isForeign(m)?`<em>${m}</em>`:m);
@@ -178,7 +213,14 @@ export default function App() {
         s.onload=res;s.onerror=rej;document.head.appendChild(s);
       });
     }
-    const secs=parseCnt(content);
+    const {secs, fnDefs}=parseCnt(content);
+    // Build fnMap: local key → global sequential number
+    let globalFnCounter=0;
+    const fnMap={};
+    for(const key of Object.keys(fnDefs).sort((a,b)=>Number(a)-Number(b))){
+      globalFnCounter++;
+      fnMap[key]=globalFnCounter;
+    }
     const fmt=(isEbook?EFORMATS:FORMATS)[format]||(isEbook?EFORMATS["Tablet 10\""]:FORMATS.A5);
     const hf=headFont, bf=bodyFont;
 
@@ -280,6 +322,36 @@ export default function App() {
     };
     covers[theme]();
 
+    // ── FOOTNOTE XML BUILDER ──
+    // Word proper footnotes via w:footnote elements
+    // We collect all footnotes, then inject at end + in footnotesPart
+    const footnotesXml = []; // array of {id, text}
+    let fnIdCounter = 1;
+
+    // helper: inline footnote reference run
+    const fnRef = id => `<w:r><w:rPr><w:vertAlign w:val="superscript"/><w:color w:val="${ph}"/><w:sz w:val="${TH.fnSz}"/><w:rFonts w:ascii="${bf}" w:hAnsi="${bf}"/></w:rPr><w:t>${id}</w:t></w:r>`;
+
+    // Build run with inline footnote markers replaced
+    const rWithFn = (text, opts={}) => {
+      // Replace [1] (1) ^1 with Word footnote references
+      const parts = text.split(/(\[\d+\]|\(\d+\)|\^\d+)/g);
+      return parts.filter(Boolean).map(part => {
+        const km = part.match(/^\[(\d+)\]$|^\((\d+)\)$|^\^(\d+)$/);
+        if(km){
+          const key = km[1]||km[2]||km[3];
+          if(fnDefs[key]){
+            const gn = fnMap[key] || key;
+            // Register footnote if not yet
+            if(!footnotesXml.find(f=>f.id===gn)){
+              footnotesXml.push({id:gn, text:fnDefs[key]});
+            }
+            return fnRef(gn);
+          }
+        }
+        return rMix(part, opts);
+      }).join("");
+    };
+
     // ── CONTENT ──
     for(const sec of secs){
       if(sec.type==="h"){
@@ -311,7 +383,9 @@ export default function App() {
       }
       for(const pp of sec.p||[]){
         if(pp.type==="p"){
-          body+=p(rMix(pp.text,{sz:aBodySz,f:bf}),{al:TH.bAlign,ind:aBodyIn,ln:aBodyLn,af:aBodyAft,be:0,kl:true});
+          // Use rWithFn to handle inline footnote markers
+          const runs = pp.fnDefs ? rWithFn(pp.text,{sz:aBodySz,f:bf}) : rMix(pp.text,{sz:aBodySz,f:bf});
+          body+=p(runs,{al:TH.bAlign,ind:aBodyIn,ln:aBodyLn,af:aBodyAft,be:0,kl:true});
         }else if(pp.type==="q"){
           const qMap={
             islami:()=>body+=p(r(`"${pp.text}"`,{i:true,sz:TH.pqSz,c:ph,f:hf}),{al:"center",iLR:720,be:180,af:180,kl:true,bL:true}),
@@ -325,7 +399,11 @@ export default function App() {
         }else if(pp.type==="a"){
           body+=p(r(pp.text,{sz:TH.arabSz,f:TH.arabFont||"Amiri",rtl:true}),{al:"right",be:160,af:160,rtl:true,kl:true});
         }else if(pp.type==="f"){
-          body+=p(r(`* ${pp.text}`,{sz:TH.fnSz,c:"666666",f:bf}),{be:140,af:0,bT:true});
+          // Manual [CATATAN] tag → juga masuk sebagai footnote proper
+          fnIdCounter++;
+          const manualId = fnIdCounter;
+          footnotesXml.push({id:manualId, text:pp.text});
+          body+=`<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="${aBodyLn}" w:lineRule="auto"/><w:ind w:firstLine="${aBodyIn}"/><w:widowControl/></w:pPr>${fnRef(manualId)}</w:p>`;
         }
       }
     }
@@ -364,22 +442,90 @@ export default function App() {
     const mkHdr=x=>`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${x}</w:hdr>`;
     const mkFtr=x=>`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${x}</w:ftr>`;
 
+    // ── BUILD FOOTNOTES PART (Word proper footnotes) ──
+    const hasFn = footnotesXml.length > 0;
+    // Word requires separator footnotes (id=-1 and id=0)
+    const fnPartXml = hasFn ? `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:footnote w:type="separator" w:id="-1">
+    <w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
+      <w:r><w:separator/></w:r></w:p></w:footnote>
+  <w:footnote w:type="continuationSeparator" w:id="0">
+    <w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
+      <w:r><w:continuationSeparator/></w:r></w:p></w:footnote>
+  ${footnotesXml.map(fn=>`
+  <w:footnote w:id="${fn.id}">
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="FootnoteText"/>
+        <w:spacing w:before="0" w:after="80" w:line="240" w:lineRule="auto"/>
+        <w:jc w:val="both"/>
+      </w:pPr>
+      <w:r><w:rPr>
+        <w:vertAlign w:val="superscript"/>
+        <w:sz w:val="${TH.fnSz}"/>
+        <w:color w:val="${ph}"/>
+        <w:rFonts w:ascii="${bf}" w:hAnsi="${bf}"/>
+      </w:rPr><w:t>${fn.id}</w:t></w:r>
+      <w:r><w:rPr>
+        <w:sz w:val="${TH.fnSz}"/>
+        <w:szCs w:val="${TH.fnSz}"/>
+        <w:color w:val="444444"/>
+        <w:rFonts w:ascii="${bf}" w:hAnsi="${bf}"/>
+      </w:rPr><w:t xml:space="preserve"> ${esc(fn.text)}</w:t></w:r>
+    </w:p>
+  </w:footnote>`).join("")}
+</w:footnotes>` : null;
+
+    // Styles with FootnoteText style defined
+    const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:rPrDefault><w:rPr>
+    <w:rFonts w:ascii="${bf}" w:hAnsi="${bf}"/>
+    <w:sz w:val="${aBodySz}"/><w:szCs w:val="${aBodySz}"/>
+  </w:rPr></w:rPrDefault></w:docDefaults>
+  <w:style w:type="character" w:styleId="FootnoteReference">
+    <w:name w:val="footnote reference"/>
+    <w:rPr><w:vertAlign w:val="superscript"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="FootnoteText">
+    <w:name w:val="footnote text"/>
+    <w:pPr><w:spacing w:after="80" w:line="240" w:lineRule="auto"/></w:pPr>
+    <w:rPr>
+      <w:sz w:val="${TH.fnSz}"/><w:szCs w:val="${TH.fnSz}"/>
+      <w:rFonts w:ascii="${bf}" w:hAnsi="${bf}"/>
+    </w:rPr>
+  </w:style>
+</w:styles>`;
+
     const ov=[
       `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>`,
       `<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>`,
       `<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>`,
+      hasFn?`<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>`:"",
       media==="cetak"?`<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>` :"",
       media==="cetak"?`<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>` :"",
     ].filter(Boolean).join("\n");
+
+    // Document rels — tambah footnotes relationship
+    const docRels=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>
+  ${hasFn?`<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>`:""}
+  ${media==="cetak"?`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`:""}
+</Relationships>`;
 
     const zip=new window.JSZip();
     zip.file("[Content_Types].xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>${ov}</Types>`);
     zip.file("_rels/.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
     zip.file("word/document.xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w14" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>${body}</w:body></w:document>`);
-    zip.file("word/styles.xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${bf}" w:hAnsi="${bf}"/><w:sz w:val="${aBodySz}"/><w:szCs w:val="${aBodySz}"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>`);
+    zip.file("word/styles.xml", stylesXml);
     zip.file("word/settings.xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="720"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`);
-    zip.file("word/_rels/document.xml.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>${media==="cetak"?`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`:""}
-</Relationships>`);
+    zip.file("word/_rels/document.xml.rels", docRels);
+    if(hasFn) zip.file("word/footnotes.xml", fnPartXml);
     if(media==="cetak"){
       zip.file("word/header1.xml",mkHdr(headers[TH.hStyle]||headers.italic));
       zip.file("word/footer1.xml",mkFtr(footers[TH.fStyle]||footers.titik));
@@ -398,7 +544,17 @@ export default function App() {
     setGen(false);setTimeout(()=>setStatus(""),4000);
   };
 
-  const doPreview=()=>{setGen(true);setTimeout(()=>{setPreview(parseCnt(content));setGen(false);setStep(3);},400);};
+  const doPreview=()=>{
+    setGen(true);
+    setTimeout(()=>{
+      const parsed=parseCnt(content);
+      // Build fnMap for preview rendering
+      let n=0;const fm={};
+      Object.keys(parsed.fnDefs).sort((a,b)=>Number(a)-Number(b)).forEach(k=>{n++;fm[k]=n;});
+      setPreview({...parsed,fnMap:fm});
+      setGen(false);setStep(3);
+    },400);
+  };
 
   const fmtOpts=isEbook?EFORMATS:FORMATS;
   const canNext=[true,true,content.trim().length>10,meta.judul.trim().length>0&&meta.penulis.trim().length>0,true];
@@ -729,7 +885,7 @@ export default function App() {
               )}
 
               {/* Preview content */}
-              {preview?preview.slice(0,8).map((sec,i)=>(
+              {preview?preview.secs.slice(0,8).map((sec,i)=>(
                 <div key={i}>
                   {sec.type==="h"&&(
                     <div style={{fontFamily:getCSS(headFont),fontSize:14,fontWeight:TH.headSz>=38?700:400,color:TH.p,margin:"12px 0 5px",
@@ -750,7 +906,13 @@ export default function App() {
                         textIndent:aBodyIn>0?`${aBodyIn/1440}in`:"0",
                         margin:`0 0 ${aBodyAft>0?8:2}px`,
                         fontFamily:getCSS(bodyFont),color:TH.text,wordSpacing:"normal",
-                      }} dangerouslySetInnerHTML={{__html:iHTML(pp.text)}}/>}
+                      }} dangerouslySetInnerHTML={{__html:
+                        // Render inline footnote markers as superscript in preview
+                        iHTML(pp.text).replace(/\[(\d+)\]|\((\d+)\)|\^(\d+)/g, (m,a,b,c)=>{
+                          const k=a||b||c;
+                          return `<sup style="font-size:0.75em;color:${TH.p};font-weight:700;line-height:0">${preview.fnMap?.[k]||k}</sup>`;
+                        })
+                      }}/>}
                       {pp.type==="q"&&<div style={{fontFamily:getCSS(headFont),fontSize:11,color:TH.p,fontStyle:"italic",margin:"7px 0",
                         ...(theme==="islami"?{textAlign:"center",borderLeft:`3px solid ${TH.a}`,paddingLeft:8}:{}),
                         ...(theme==="anak"?{textAlign:"center",background:TH.bg,padding:"5px",border:`1px solid ${TH.a}`}:{}),
@@ -758,11 +920,26 @@ export default function App() {
                         ...(theme==="bisnis"?{background:"#F5F5F5",padding:"5px 9px",borderLeft:`4px solid ${TH.p}`}:{}),
                       }}>{`"${pp.text}"`}</div>}
                       {pp.type==="a"&&<div style={{textAlign:"right",fontSize:14,fontFamily:"Amiri,serif",direction:"rtl",margin:"7px 0",color:TH.p}}>{pp.text}</div>}
-                      {pp.type==="f"&&<div style={{fontSize:9,color:"#888",borderTop:"0.5px solid #ccc",marginTop:8,paddingTop:3}}>* {pp.text}</div>}
+                      {pp.type==="f"&&<div style={{fontSize:9,color:"#888",borderTop:"0.5px solid #ccc",marginTop:8,paddingTop:3,fontFamily:getCSS(bodyFont)}}>
+                        <sup style={{color:TH.p,fontWeight:700}}>†</sup> {pp.text}
+                      </div>}
                     </div>
                   ))}
                 </div>
               )):<div style={{textAlign:"center",padding:"40px 0",color:"#ccc",fontSize:13}}>Preview konten akan tampil di sini</div>}
+
+              {/* Footnote preview area */}
+              {preview&&preview.fnDefs&&Object.keys(preview.fnDefs).length>0&&(
+                <div style={{marginTop:16,borderTop:`1.5px solid ${TH.a}`,paddingTop:8}}>
+                  <div style={{width:"35%",height:0.5,background:"#ccc",marginBottom:6}}/>
+                  {Object.entries(preview.fnDefs).map(([k,txt])=>(
+                    <div key={k} style={{display:"flex",gap:5,marginBottom:4,fontFamily:getCSS(bodyFont),fontSize:9,color:"#555",lineHeight:1.6}}>
+                      <sup style={{color:TH.p,fontWeight:700,flexShrink:0,marginTop:1}}>{preview.fnMap?.[k]||k}</sup>
+                      <span>{txt}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Footer mock */}
               {!isEbook&&preview&&(
